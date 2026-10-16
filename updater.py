@@ -85,7 +85,9 @@ class DataUpdater:
             (force and not self.pending_force) or (verify and not self.pending_verify)
         ):
             previous = self.pending
-            await asyncio.shield(previous)
+            # 只等较弱的上一轮结束，不继承它的异常；本次更强的更新照常执行。
+            # asyncio.wait 不会取消 previous，当前任务被取消时也能正常传播。
+            await asyncio.wait({previous})
             if self.pending is previous and previous.done():
                 self.pending = None
         if self.pending is None:
@@ -541,9 +543,9 @@ class DataUpdater:
             "checked_at": checked_at,
             "updated_at": time.time(),
             "content_hash": digest,
-            "last_verified_at": time.time()
-            if full_verify and not failures
-            else last_verified,
+            # 完整校验跑完即记录时间；失败的图片不可复用，每轮常规更新都会单独重试，
+            # 不必因为一张图持续失败就每小时重新全量校验。
+            "last_verified_at": time.time() if full_verify else last_verified,
             "ships": len(snapshot.ships),
             "images": len(rows),
             "pending_names": len(snapshot.pending_ship_ids),

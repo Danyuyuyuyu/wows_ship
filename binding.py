@@ -107,11 +107,18 @@ class BindingSessions:
         self.sessions: dict[tuple[str, str, str | None], BindingSession] = {}
         self.lock = asyncio.Lock()
 
-    def _prune(self) -> None:
+    def _prune(self, grace: float = 0) -> None:
         now = time.monotonic()
         for key, session in tuple(self.sessions.items()):
-            if session.expires_at_monotonic <= now:
+            if session.expires_at_monotonic + grace <= now:
                 del self.sessions[key]
+
+    def active(
+        self, bot_id: str, user_id: str, group_id: str | None, grace: float = 0
+    ) -> BindingSession | None:
+        """返回该作用域的会话；过期超过 grace 秒的会话直接静默清理。"""
+        self._prune(grace)
+        return self.sessions.get((bot_id, user_id, group_id))
 
     async def begin(self, session: BindingSession) -> None:
         async with self.lock:

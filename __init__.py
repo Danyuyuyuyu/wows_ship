@@ -259,11 +259,16 @@ async def command_allowed(bot: BaseBot, event: Event) -> bool:
     return service is not None and service.allowed(scope(bot, event)[2])
 
 
+def is_binding_reply(text: str) -> bool:
+    """只把“取消”或 1–2 位数字视为候选回复，其他消息一律放行给别的插件。"""
+    return text == "取消" or (text.isascii() and text.isdecimal() and len(text) <= 2)
+
+
 async def pending_reply(bot: BaseBot, event: Event, state: T_State) -> bool:
     if not isinstance(bot, Bot) or not isinstance(event, MessageEvent):
         return False
     text = event.get_plaintext().strip()
-    if any(command in text for command in COMMANDS):
+    if not is_binding_reply(text):
         return False
     service = await get_service()
     if service is None or not service.allowed(scope(bot, event)[2]):

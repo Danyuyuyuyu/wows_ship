@@ -11,6 +11,7 @@ from pathlib import Path
 import secrets
 import shlex
 import time
+import unicodedata
 
 from .api import HttpWowsApi
 from .binding import BindingSession, BindingSessions, BindingStore
@@ -34,6 +35,10 @@ from .storage import StorageError, atomic_write, read_json
 from .updater import DataUpdater
 
 logger = logging.getLogger(__name__)
+
+# 同一船库版本下，未知舰船 ID 最多触发几次强制同步；仍补不上（下架船、错误 ID）
+# 就停止重试，直到船库发布新版本或服务重启，避免每小时整库重抓。
+UNKNOWN_SYNC_MAX_ATTEMPTS = 3
 
 
 class WowsService:
@@ -89,6 +94,8 @@ class WowsService:
         self.history = HistoryStore(self.api, settings, data_path)
         self.history.on_refresh = self._history_changed
         self._unknown_ids = set()
+        self._unknown_attempts: dict[int, int] = {}
+        self._unknown_attempts_version = None
         self._unknown_task = None
         self._unknown_lock = asyncio.Lock()
         self._unknown_sync_after = 0
@@ -236,12 +243,13 @@ class WowsService:
                 await self.health.issue(
                     "disk", "剩余磁盘空间不足，暂停新增缓存与备份", severity="critical"
                 )
+                await self.health.heartbeat("maintenance", "sleeping")
                 return {"status": "disk_low"}
             await self.health.recover("disk")
             await self._sync_translations()
             active = await asyncio.to_thread(self.paths.active, self.settings.language)
             now = time.time()
-            fingerprint = await asyncio.to_thread(self._translation_fingerprint)
+            fingerprint = await self._safe_fingerprint()
             before = self.health.state.get("translation_fingerprint")
             catalog_due = (
                 active is None
@@ -253,7 +261,8 @@ class WowsService:
                 or now - active.get("last_verified_at", 0)
                 >= self.settings.image_verify_days * 86400
             )
-            names_changed = before != fingerprint
+            # 指纹算不出来时不当作“名称变化”，也不中断后面的备份等巡检步骤。
+            names_changed = fingerprint is not None and before != fingerprint
             images_due = (
                 bool(active and active.get("failed_images", 0))
                 and now - self.health.state.get("images_attempt_at", 0)
@@ -269,9 +278,11 @@ class WowsService:
                     )
                     self._maintenance_failures = 0
                     self._maintenance_retry_at = 0
-                    self.health.state[
-                        "translation_fingerprint"
-                    ] = await asyncio.to_thread(self._translation_fingerprint)
+                    updated_fingerprint = await self._safe_fingerprint()
+                    if updated_fingerprint is not None:
+                        self.health.state[
+                            "translation_fingerprint"
+                        ] = updated_fingerprint
                     await self.health.success("catalog_update")
                     await self.health.recover("public_data")
                     if report.failed_images:
@@ -290,7 +301,7 @@ class WowsService:
                         "catalog_update",
                         "船库巡检更新失败，继续使用已有资料：" + type(error).__name__,
                     )
-            elif before is None:
+            elif before is None and fingerprint is not None:
                 self.health.state["translation_fingerprint"] = fingerprint
             active = await asyncio.to_thread(self.paths.active, self.settings.language)
             if active and active.get("pending_names", 0):
@@ -341,6 +352,18 @@ class WowsService:
                 "catalog_due": catalog_due,
                 "verify_due": verify_due,
             }
+
+    async def _safe_fingerprint(self):
+        try:
+            fingerprint = await asyncio.to_thread(self._translation_fingerprint)
+        except (StorageError, OSError, ValueError) as error:
+            await self.health.issue(
+                "translation_fingerprint",
+                "客户端名称资源无法读取，本轮跳过名称变化检查：" + type(error).__name__,
+            )
+            return None
+        await self.health.recover("translation_fingerprint")
+        return fingerprint
 
     async def _maintenance_loop(self):
         while not self.closed:
@@ -425,6 +448,10 @@ class WowsService:
             else set()
         )
         async with self._unknown_lock:
+            version = snapshot.data_version if snapshot else None
+            if version != self._unknown_attempts_version:
+                self._unknown_attempts.clear()
+                self._unknown_attempts_version = version
             self._unknown_ids.update(set(identifiers) - ready)
             self._unknown_ids.difference_update(ready)
             if not self._unknown_ids:
@@ -433,6 +460,15 @@ class WowsService:
             if self._unknown_task is not None and not self._unknown_task.done():
                 await self._persist_unknown_pending()
                 return self._unknown_task
+            retryable = {
+                identifier
+                for identifier in self._unknown_ids
+                if self._unknown_attempts.get(identifier, 0)
+                < UNKNOWN_SYNC_MAX_ATTEMPTS
+            }
+            if not retryable:
+                await self._persist_unknown_pending()
+                return None
             if time.monotonic() < self._unknown_sync_after:
                 await self._persist_unknown_pending()
                 return None
@@ -472,14 +508,18 @@ class WowsService:
                 time.monotonic() + self.settings.unknown_ship_refresh_minutes * 60
             )
             attempted = time.time()
-            await atomic_write(
-                path,
-                {
-                    "schema_version": 1,
-                    "last_attempt_at": attempted,
-                    "pending_ship_ids": sorted(self._unknown_ids),
-                },
-            )
+            try:
+                await atomic_write(
+                    path,
+                    {
+                        "schema_version": 1,
+                        "last_attempt_at": attempted,
+                        "pending_ship_ids": sorted(self._unknown_ids),
+                    },
+                )
+            except StorageError:
+                # 记录写不进去不影响选船；进程内的 _unknown_sync_after 仍会限频。
+                logger.warning("未知船同步记录保存失败，仍继续后台同步")
             self._unknown_task = asyncio.create_task(
                 self._sync_unknown_catalog(attempted)
             )
@@ -503,6 +543,13 @@ class WowsService:
                     if ship.ship_id not in current.pending_ship_ids
                 }
                 self._unknown_ids.difference_update(ready)
+                self._unknown_attempts_version = current.data_version
+            # 只有同步本身成功、船仍不在目录时才计数；API 故障不消耗重试次数。
+            self._unknown_attempts = {
+                identifier: self._unknown_attempts.get(identifier, 0)
+                + (error is None)
+                for identifier in self._unknown_ids
+            }
             try:
                 await atomic_write(
                     self.paths.unknown_sync(self.settings.language),
@@ -618,8 +665,14 @@ class WowsService:
         return candidates, session
 
     def pending_binding(self, bot_id: str, user_id: str, group_id: str | None):
-        """Return the pending session for a scope, if one exists."""
-        return self.sessions.sessions.get((bot_id, user_id, group_id))
+        """Return the pending session for a scope, if one exists.
+
+        超时后再保留一个超时周期，用于提示“会话已超时”；之后静默清理，
+        避免很久以后的普通消息被当成绑定回复。
+        """
+        return self.sessions.active(
+            bot_id, user_id, group_id, grace=self.settings.binding_timeout_seconds
+        )
 
     async def cancel_binding(
         self,
@@ -722,8 +775,15 @@ class WowsService:
         selection = self.names.apply(selection)
         ship_name_en = self.names.english_for(selection.ship, selection.data_version)
         image_data = None
-        image_url = selection.ship.image_url or selection.ship.contour_url
-        if image_url:
+        # 高清图优先；高清图下载失败时退回轮廓图，而不是直接出无图卡片。
+        image_urls = [
+            url
+            for url in dict.fromkeys(
+                (selection.ship.image_url, selection.ship.contour_url)
+            )
+            if url
+        ]
+        for image_url in image_urls:
             try:
                 image = await asyncio.wait_for(
                     self.images.get(image_url),
@@ -735,8 +795,16 @@ class WowsService:
                 image_data = "data:image/png;base64," + base64.b64encode(image).decode(
                     "ascii"
                 )
+                if image_url != selection.ship.image_url:
+                    # 卡片按 image_url 为空判断轮廓样式，改用轮廓图时同步标记。
+                    selection = replace(
+                        selection, ship=replace(selection.ship, image_url=None)
+                    )
+                break
             except Exception as error:
-                logger.warning("舰图下载失败，生成无图卡片（%s）", type(error).__name__)
+                logger.warning("舰图下载失败（%s）", type(error).__name__)
+        if image_urls and image_data is None:
+            logger.warning("舰图均不可用，生成无图卡片")
         return await self.renderer.render(
             selection,
             image_data,
@@ -750,8 +818,9 @@ class WowsService:
             raise SelectionError(ErrorCode.BINDING_REQUIRED)
         if account.server != "asia":
             raise SelectionError(ErrorCode.UNSUPPORTED_ACCOUNT)
-        text = arguments.strip()
-        action, _, remainder = text.partition(" ")
+        # 与选船参数一致：NFKC 统一全角空格/全角数字，再按任意空白切分动作。
+        text = unicodedata.normalize("NFKC", arguments).strip()
+        action, remainder = (text.split(maxsplit=1) + ["", ""])[:2]
         actions = {
             "添加": "add",
             "移除": "remove",
@@ -772,7 +841,9 @@ class WowsService:
         for ship in snapshot.ships:
             if ship.ship_id not in snapshot.pending_ship_ids:
                 label = self.names.name_for(ship, snapshot.data_version)
-                labels.setdefault(label.casefold(), []).append(ship.ship_id)
+                key = unicodedata.normalize("NFKC", label).casefold()
+                labels.setdefault(key, []).append(ship.ship_id)
+        known_ids = {ship.ship_id for ship in snapshot.ships}
         ids = set()
         if action in {"add", "remove", "set"}:
             if not remainder.strip():
@@ -780,14 +851,24 @@ class WowsService:
                     "请提供船 ID 或准确客户端船名；空清单请明确使用“清空”。"
                 )
             whole = labels.get(remainder.strip().casefold(), [])
-            tokens = (
-                [remainder.strip()]
-                if len(whole) == 1
-                else shlex.split(remainder.replace("，", " ").replace(",", " "))
-            )
+            if len(whole) == 1:
+                tokens = [remainder.strip()]
+            else:
+                separated = remainder.replace("，", " ").replace(",", " ")
+                try:
+                    tokens = shlex.split(separated)
+                except ValueError:
+                    # 船名里有撇号（如 L'Audacieux）时 shlex 会报错，退回按空白切分。
+                    tokens = separated.split()
             for token in tokens:
                 if token.isascii() and token.isdecimal() and int(token) > 0:
-                    ids.add(int(token))
+                    identifier = int(token)
+                    if action != "remove" and identifier not in known_ids:
+                        raise ValueError(
+                            f"船 ID {identifier} 不在当前船库中，请检查是否输错；"
+                            "新船请等船库更新后再添加。"
+                        )
+                    ids.add(identifier)
                 elif len(labels.get(token.casefold(), [])) == 1:
                     ids.add(labels[token.casefold()][0])
                 else:
@@ -825,13 +906,22 @@ class WowsService:
         )
 
     async def refresh_data(self):
+        self._ensure_maintenance_idle()
         async with self._maintenance_lock:
             await self._sync_translations(force=True)
             return await self.updater.update(force=True)
 
     async def verify_data(self):
+        self._ensure_maintenance_idle()
         async with self._maintenance_lock:
             return await self.updater.update(force=False, verify=True)
+
+    def _ensure_maintenance_idle(self):
+        """巡检可能占锁长达 UPDATE_TIMEOUT_SECONDS；命令不排队干等，直接提示。"""
+        if self._maintenance_lock.locked():
+            raise BusyError(
+                "后台巡检正在检查船库，请稍后再试；巡检完成后会自动使用最新资料。"
+            )
 
     async def data_status(self):
         row = await asyncio.to_thread(self.paths.active, self.settings.language)
