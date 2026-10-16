@@ -1,0 +1,114 @@
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { width: 840px; }
+body {
+  width: 840px;
+  background: #0e0e10;
+  font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Source Han Sans SC",
+    "WenQuanYi Micro Hei", -apple-system, sans-serif;
+}
+.card {
+  --ac: 255, 255, 255;
+  --aa: 0;
+  position: relative;
+  width: 840px;
+  overflow: hidden;
+  border-radius: 36px;
+  color: #fff;
+  background: radial-gradient(90% 60% at 50% 62%, #1c3049 0%, #142840 45%, #0d1b2d 100%);
+  box-shadow: inset 0 0 0 1.5px rgba(var(--ac), calc(.08 + var(--aa) * .4));
+}
+.card::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 220px;
+  border-radius: 34px 34px 0 0;
+  pointer-events: none;
+  background: radial-gradient(70% 100% at 85% 0%, rgba(var(--ac), calc(var(--aa) * .22)), transparent 70%);
+}
+.card.premium { --ac: 234, 194, 107; --aa: 1; }
+.card.special { --ac: 79, 185, 201; --aa: 1; }
+.card.super { --ac: 233, 115, 102; --aa: 1; }
+.head { position: relative; padding: 34px 40px 0; }
+.top { display: flex; justify-content: space-between; align-items: center; height: 46px; }
+.for { display: flex; align-items: center; gap: 10px; font-size: 22px; color: rgba(255, 255, 255, .65); }
+.for b { color: #8fc2f5; font-weight: 500; }
+.for .dot { width: 8px; height: 8px; flex: none; border-radius: 50%; background: #5E9FE8; }
+h1 { margin-top: 14px; font-size: 54px; font-weight: 700; letter-spacing: 1px; line-height: 1.15; }
+.en { margin-top: 6px; font-size: 22px; color: rgba(255, 255, 255, .5); letter-spacing: 1.5px; }
+.tags { display: flex; gap: 12px; margin-top: 24px; }
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 46px;
+  padding: 0 18px;
+  border-radius: 23px;
+  white-space: nowrap;
+  background: rgba(255, 255, 255, .08);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .14);
+  font-size: 23px;
+  color: #e8eef6;
+}
+.tier { min-width: 62px; justify-content: center; font-family: Georgia, serif; font-weight: 700; letter-spacing: 1px; font-size: 22px; }
+.tier.sup {
+  color: #F09A8F;
+  background: rgba(233, 115, 102, .15);
+  box-shadow: inset 0 0 0 1px rgba(233, 115, 102, .55);
+  font-family: inherit;
+}
+.tag img.ico { width: 32px; height: 32px; margin: 0 -3px; }
+.tag img.flg { width: 37px; height: 24px; border-radius: 3px; }
+.cat { height: 44px; font-weight: 500; font-size: 21px; }
+.cat img { width: 22px; height: 22px; }
+.ship { position: relative; display: flex; align-items: center; justify-content: center; height: 370px; margin-top: 4px; }
+.ship img {
+  width: 760px;
+  max-height: 344px;
+  object-fit: contain;
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 9%, #000 91%, transparent 100%),
+    linear-gradient(180deg, transparent 0, #000 12%, #000 88%, transparent 100%);
+  -webkit-mask-composite: source-in;
+  mask-composite: intersect;
+}
+.ship img.contour { filter: brightness(0) invert(1); }
+.ship.empty { background: radial-gradient(60% 70% at 50% 50%, rgba(255, 255, 255, .05), transparent 70%); }
+.foot {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 22px 40px 28px;
+  border-top: 1px solid rgba(255, 255, 255, .1);
+  font-size: 21px;
+  color: rgba(255, 255, 255, .55);
+}
+.foot .cta { color: rgba(255, 255, 255, .8); }
+.foot .cta b { color: #8fc2f5; font-weight: 500; }
+</style>
+{%- macro icon(uri, cls) -%}
+{%- if uri %}<img class="{{ cls }}" src="{{ uri }}" alt="">{% endif -%}
+{%- endmacro -%}
+<div class="card {{ category }}">
+<div class="head">
+<div class="top">
+<div class="for"><span class="dot"></span>为 <b>@{{ requester }}</b> 抽取</div>
+{% if category_label %}<span class="tag cat"><img class="cat-ico" src="{{ category_icon }}" alt="">{{ category_label }}</span>{% endif %}
+</div>
+<h1>{{ name }}</h1>
+{% if name_en %}<div class="en">{{ name_en }}</div>{% endif %}
+<div class="tags">
+<span class="tag tier{% if is_super %} sup{% endif %}">{{ tier_label }}</span>
+<span class="tag">{{ icon(type_icon, "ico") }}{{ type_label }}</span>
+<span class="tag">{{ icon(nation_icon, "flg") }}{{ nation_label }}</span>
+</div>
+</div>
+<div class="ship{% if not image_url %} empty{% endif %}">
+{% if image_url %}<img{% if is_contour %} class="contour"{% endif %} src="{{ image_url }}" alt="{{ name }}">{% endif %}
+</div>
+<div class="foot">
+<span>抽取范围 · {{ pool_label }}</span>
+<span class="cta">发送 <b>「选船」</b> 再抽一次</span>
+</div>
+</div>
